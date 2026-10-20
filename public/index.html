@@ -34,10 +34,11 @@
         <path d="M15 29 Q20 33.5 25 29" stroke="#1C1F23" stroke-width="1.6" fill="none" stroke-linecap="round"/>
       </svg>
       <h2>Sign in to FreshCatch</h2>
-      <p>Enter your access code to open the dashboard. It stays on this device until you log out.</p>
+      <p id="gateCopy">Enter your username and password to open the dashboard.</p>
       <p id="gateError" class="gate-error hidden"></p>
       <form id="gateForm">
-        <input id="gateInput" type="password" placeholder="Access code" autocomplete="current-password">
+        <input id="gateUser" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false">
+        <input id="gateInput" type="password" placeholder="Password" autocomplete="current-password">
         <button type="submit">Sign in</button>
       </form>
     </div>

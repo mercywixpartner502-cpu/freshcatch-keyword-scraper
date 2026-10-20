@@ -12,6 +12,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const db = require('./lib/db');
 const { runScan, activeHubs } = require('./lib/scan');
@@ -24,10 +25,31 @@ const githubSrc = require('./lib/sources/github');
 const hnSrc = require('./lib/sources/hn');
 const trendsSrc = require('./lib/sources/trends');
 
+// Minimal .env loader — keeps keys out of the repo while local runs pick them up.
+try {
+  const envRaw = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+  for (const line of envRaw.split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m || process.env[m[1]] !== undefined) continue;
+    let value = m[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    process.env[m[1]] = value;
+  }
+} catch {}
+
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const ACCESS_CODE = process.env.ACCESS_CODE || '';
+const DASH_USERNAME = process.env.DASH_USERNAME || '';
+const DASH_PASSWORD = process.env.DASH_PASSWORD || '';
+const SESSION_SECRET = process.env.SESSION_SECRET || '';
+const LOGIN_ENABLED = !!(DASH_USERNAME && DASH_PASSWORD);
+const AUTH_REQUIRED = LOGIN_ENABLED || !!ACCESS_CODE;
+const SESSION_COOKIE = 'fc_session';
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SCAN_HOUR = Number.isFinite(Number(process.env.SCAN_HOUR)) ? Number(process.env.SCAN_HOUR) : 8;
 
 const MIME = {
@@ -89,16 +111,165 @@ function serveStatic(res, pathname) {
   });
 }
 
+/* ------------------------------ auth ------------------------------ */
+
+const loginAttempts = new Map();
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 8;
+
+function timingSafeEqualStr(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function sessionSecret() {
+  if (SESSION_SECRET) return SESSION_SECRET;
+  return crypto.createHash('sha256').update(`freshcatch|${DASH_USERNAME}|${DASH_PASSWORD}|${ACCESS_CODE}`).digest('hex');
+}
+
+function signPayload(payload) {
+  return crypto.createHmac('sha256', sessionSecret()).update(payload).digest('base64url');
+}
+
+function issueSession(user) {
+  const payload = `${Date.now() + SESSION_TTL_MS}.${Buffer.from(String(user)).toString('base64url')}`;
+  return `${payload}.${signPayload(payload)}`;
+}
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    const key = part.slice(0, i).trim();
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      out[key] = part.slice(i + 1).trim();
+    }
+  }
+  return out;
+}
+
+function readSession(req) {
+  const raw = parseCookies(req)[SESSION_COOKIE];
+  if (!raw) return null;
+  const parts = raw.split('.');
+  if (parts.length !== 3) return null;
+  const payload = `${parts[0]}.${parts[1]}`;
+  const given = Buffer.from(parts[2]);
+  const expected = Buffer.from(signPayload(payload));
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+  const exp = Number(parts[0]);
+  if (!Number.isFinite(exp) || exp < Date.now()) return null;
+  try {
+    return { user: Buffer.from(parts[1], 'base64url').toString() || 'user', exp };
+  } catch {
+    return null;
+  }
+}
+
+function isHttps(req) {
+  return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+}
+
+function setSessionCookie(req, res, token) {
+  res.setHeader(
+    'Set-Cookie',
+    [
+      `${SESSION_COOKIE}=${token}`,
+      'HttpOnly',
+      'Path=/',
+      'SameSite=Lax',
+      `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+      isHttps(req) ? 'Secure' : '',
+    ]
+      .filter(Boolean)
+      .join('; ')
+  );
+}
+
+function clearSessionCookie(req, res) {
+  res.setHeader(
+    'Set-Cookie',
+    [`${SESSION_COOKIE}=`, 'HttpOnly', 'Path=/', 'SameSite=Lax', 'Max-Age=0', isHttps(req) ? 'Secure' : '']
+      .filter(Boolean)
+      .join('; ')
+  );
+}
+
 function authorized(req, url) {
-  if (!ACCESS_CODE) return true;
+  if (!AUTH_REQUIRED) return true;
+  if (readSession(req)) return true;
+  if (!ACCESS_CODE) return false;
   const header = req.headers['x-access-code'] || '';
   const queryCode = url.searchParams.get('code') || '';
-  return header === ACCESS_CODE || queryCode === ACCESS_CODE;
+  return timingSafeEqualStr(header, ACCESS_CODE) || timingSafeEqualStr(queryCode, ACCESS_CODE);
+}
+
+function loginBlocked(ip) {
+  const rec = loginAttempts.get(ip);
+  if (!rec) return false;
+  if (rec.resetAt < Date.now()) {
+    loginAttempts.delete(ip);
+    return false;
+  }
+  return rec.count >= LOGIN_MAX_ATTEMPTS;
+}
+
+function recordFailedLogin(ip) {
+  const now = Date.now();
+  const rec = loginAttempts.get(ip);
+  if (!rec || rec.resetAt < now) loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  else rec.count += 1;
+}
+
+function handleAuthInfo(req, res) {
+  const session = readSession(req);
+  sendJSON(res, 200, {
+    required: AUTH_REQUIRED,
+    mode: LOGIN_ENABLED ? 'password' : ACCESS_CODE ? 'code' : 'open',
+    user: session ? session.user : null,
+    signedIn: !!session,
+  });
+}
+
+async function handleLogin(req, res) {
+  if (!AUTH_REQUIRED) return sendJSON(res, 200, { ok: true, user: 'open' });
+  const ip = req.socket.remoteAddress || 'unknown';
+  if (loginBlocked(ip)) {
+    return sendJSON(res, 429, { error: 'Too many attempts — wait a few minutes and try again.' });
+  }
+  const body = await readBody(req);
+  let user = null;
+  if (
+    LOGIN_ENABLED &&
+    timingSafeEqualStr(body.username || '', DASH_USERNAME) &&
+    timingSafeEqualStr(body.password || '', DASH_PASSWORD)
+  ) {
+    user = DASH_USERNAME;
+  } else if (ACCESS_CODE && timingSafeEqualStr(body.code || body.password || '', ACCESS_CODE)) {
+    user = 'access';
+  }
+  if (!user) {
+    recordFailedLogin(ip);
+    return sendJSON(res, 401, { error: 'Wrong username or password.' });
+  }
+  loginAttempts.delete(ip);
+  setSessionCookie(req, res, issueSession(user));
+  sendJSON(res, 200, { ok: true, user });
+}
+
+function handleLogout(req, res) {
+  clearSessionCookie(req, res);
+  sendJSON(res, 200, { ok: true });
 }
 
 /* ------------------------------ API routes ------------------------------ */
 
-async function handleState(res) {
+async function handleState(req, res) {
   const hubs = await activeHubs();
   const lastScans = await db
     .query('SELECT * FROM scans ORDER BY id DESC LIMIT 5')
@@ -112,7 +283,9 @@ async function handleState(res) {
     dbMode: db.mode,
     telegram: telegram.configured(),
     ai: ai.configured(),
-    accessProtected: !!ACCESS_CODE,
+    accessProtected: AUTH_REQUIRED,
+    authMode: LOGIN_ENABLED ? 'password' : ACCESS_CODE ? 'code' : 'open',
+    user: (readSession(req) || {}).user || null,
     scanHour: SCAN_HOUR,
     publicUrl: process.env.PUBLIC_URL || null,
     hubs: hubs.map((h) => ({ id: h.id, label: h.label, custom: !h.builtin })),
@@ -326,10 +499,13 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (p === '/api/ping') return sendJSON(res, 200, { ok: true, name: 'FreshCatch' });
+    if (p === '/api/auth') return handleAuthInfo(req, res);
+    if (p === '/api/login' && req.method === 'POST') return await handleLogin(req, res);
+    if (p === '/api/logout' && req.method === 'POST') return handleLogout(req, res);
 
     if (p.startsWith('/api/')) {
       if (!authorized(req, url)) return sendJSON(res, 401, { error: 'unauthorized' });
-      if (p === '/api/state') return await handleState(res);
+      if (p === '/api/state') return await handleState(req, res);
       if (p === '/api/keywords') return await handleKeywords(res, url);
       if (p === '/api/keywords/star' && req.method === 'POST') return await handleStar(req, res);
       if (p === '/api/hubs' && req.method === 'POST') return await handleHubs(req, res);
@@ -381,6 +557,11 @@ async function boot() {
   server.listen(PORT, HOST, () => {
     console.log(`FreshCatch running →  http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
     console.log(`Daily scan at hour ${SCAN_HOUR} · Telegram ${telegram.configured() ? 'ON' : 'off'} · AI ${ai.configured() ? 'ON' : 'off'}`);
+    console.log(
+      AUTH_REQUIRED
+        ? `Login: ON — ${LOGIN_ENABLED ? `user "${DASH_USERNAME}"` : 'access code'}`
+        : 'Login: OFF (dashboard is open)'
+    );
   });
 
   if (process.argv.includes('--scan-once')) {

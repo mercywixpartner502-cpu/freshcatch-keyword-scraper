@@ -8,7 +8,9 @@ const state = {
   hubs: [],
   filter: { hub: 'all', tier: 'all', q: '', starred: false },
   lastVisit: Number(localStorage.getItem('fc_last_visit') || 0),
-  code: localStorage.getItem('fc_access_code') || '',
+  authMode: 'open',
+  user: null,
+  authed: false,
   scanning: false,
   view: 'radar',
   protected: false,
@@ -35,9 +37,7 @@ function esc(s) {
 }
 
 async function api(path, opts = {}) {
-  const headers = { ...(opts.headers || {}) };
-  if (state.code) headers['x-access-code'] = state.code;
-  const res = await fetch(path, { ...opts, headers });
+  const res = await fetch(path, opts);
   if (res.status === 401) {
     handleUnauthorized();
     throw new Error('unauthorized');
@@ -340,20 +340,25 @@ function renderCustomHubs() {
 function renderAccount() {
   const box = $('#accountBox');
   if (state.protected) {
+    const method = state.authMode === 'password' ? 'username + password' : 'access code';
+    const who = state.user ? `signed in as ${esc(state.user)}` : 'signed in';
     box.innerHTML = `
-      <div class="account-row"><span>Session</span><span class="pill on">signed in</span></div>
-      <div class="account-row"><span>Dashboard access</span><span class="pill on">access code</span></div>
+      <div class="account-row"><span>Session</span><span class="pill on">${who}</span></div>
+      <div class="account-row"><span>Method</span><span class="pill on">${method}</span></div>
       <button class="logout-wide" type="button" data-logout>Log out of this device</button>`;
   } else {
     box.innerHTML = `
       <div class="account-row"><span>Session</span><span class="pill off">open access</span></div>
-      <p class="hint">No <code>ACCESS_CODE</code> is set on the server, so sign-in is off. Set it in the host's environment variables to require the login screen.</p>`;
+      <p class="hint">No <code>DASH_USERNAME</code> / <code>DASH_PASSWORD</code> is set on the server, so sign-in is off. Set them in the host's environment variables to require the login screen.</p>`;
   }
 }
 
-function logout() {
-  localStorage.removeItem('fc_access_code');
-  state.code = '';
+async function logout() {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } catch {}
+  state.authed = false;
+  state.user = null;
   state.library = null;
   state.filter = { hub: 'all', tier: 'all', q: '', starred: false };
   $('#search').value = '';
@@ -361,6 +366,7 @@ function logout() {
   $('#scanPanel').classList.add('hidden');
   showGate();
   $('#gateInput').value = '';
+  $('#gateUser').value = '';
   $('#gateInput').focus();
 }
 
@@ -373,6 +379,9 @@ async function boot() {
     return;
   }
   state.protected = !!s.accessProtected;
+  state.authMode = s.authMode || (s.accessProtected ? 'code' : 'open');
+  state.user = s.user || null;
+  state.authed = true;
   $('#logoutBtn').classList.toggle('hidden', !state.protected);
   renderAccount();
   $('#accessGate').classList.add('hidden');
@@ -491,9 +500,7 @@ $('#list').addEventListener('click', async (e) => {
 $('#exportBtn').addEventListener('click', async () => {
   try {
     const qp = state.view === 'library' ? '' : queryPath();
-    const res = await fetch('/api/export.csv?' + qp, {
-      headers: state.code ? { 'x-access-code': state.code } : {},
-    });
+    const res = await fetch('/api/export.csv?' + qp);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const blob = await res.blob();
     const a = document.createElement('a');
@@ -582,7 +589,6 @@ function startScan() {
   $('#scanPanel').classList.remove('hidden');
 
   const params = new URLSearchParams();
-  if (state.code) params.set('code', state.code);
   if (state.filter.hub && state.filter.hub !== 'all') params.set('hubs', state.filter.hub);
 
   const es = new EventSource('/api/scan?' + params.toString());
@@ -665,20 +671,63 @@ function showGate(errorMsg) {
 }
 
 function handleUnauthorized() {
-  const hadCode = !!state.code;
-  state.code = '';
+  const expired = state.authed;
+  state.authed = false;
   state.library = null;
-  localStorage.removeItem('fc_access_code');
-  showGate(hadCode ? 'That access code was not accepted — try again.' : '');
+  showGate(expired ? 'Your session expired — sign in again.' : '');
 }
 
-$('#gateForm').addEventListener('submit', (e) => {
+function configureGate(auth) {
+  state.authMode = auth.mode || 'open';
+  state.protected = !!auth.required;
+  const userField = $('#gateUser');
+  const passField = $('#gateInput');
+  if (state.authMode === 'password') {
+    userField.classList.remove('hidden');
+    passField.placeholder = 'Password';
+    $('#gateCopy').textContent = 'Enter your username and password to open the dashboard.';
+  } else {
+    userField.classList.add('hidden');
+    passField.placeholder = 'Access code';
+    $('#gateCopy').textContent = 'Enter your access code to open the dashboard.';
+  }
+}
+
+async function init() {
+  localStorage.removeItem('fc_access_code'); // legacy storage from the old access-code gate
+  try {
+    const res = await fetch('/api/auth');
+    if (res.ok) configureGate(await res.json());
+  } catch {}
+  boot();
+}
+
+$('#gateForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const code = $('#gateInput').value.trim();
-  if (!code) return;
-  localStorage.setItem('fc_access_code', code);
-  state.code = code;
+  const username = $('#gateUser').value.trim();
+  const password = $('#gateInput').value;
+  if (!password) return;
+  if (state.authMode === 'password' && !username) {
+    showGate('Enter your username too.');
+    return;
+  }
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, code: password }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      showGate(data.error || 'Sign-in failed — check your credentials.');
+      return;
+    }
+  } catch {
+    showGate('Could not reach the server — try again.');
+    return;
+  }
   $('#accessGate').classList.add('hidden');
+  $('#gateInput').value = '';
   boot();
 });
 
@@ -693,4 +742,4 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 
-boot();
+init();
