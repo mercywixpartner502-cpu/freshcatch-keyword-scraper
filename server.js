@@ -157,7 +157,7 @@ function keywordWhere(url) {
 
 async function handleKeywords(res, url) {
   const { where, params } = keywordWhere(url);
-  const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
+  const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit')) || 200));
   const rows = await db.query(
     `SELECT hub, entity, keyword, tier, opportunity, demand, freshness, saturation, verdict,
             intent_posts, mentions, news_count, engines, sources, starred, first_seen_at, last_scan_at

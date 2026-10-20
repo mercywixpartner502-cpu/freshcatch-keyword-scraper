@@ -27,11 +27,18 @@
 
   <div id="accessGate" class="gate hidden">
     <div class="gate-card">
-      <h2>This FreshCatch is protected</h2>
-      <p>Enter your access code to open the dashboard.</p>
+      <svg class="logo gate-logo" viewBox="0 0 48 48" aria-hidden="true">
+        <ellipse cx="20" cy="24" rx="13" ry="8.5" fill="#9CAF88"/>
+        <path d="M31 24 L42 15.5 L38.5 24 L42 32.5 Z" fill="#7D8F69"/>
+        <circle cx="14.5" cy="21.5" r="2" fill="#1C1F23"/>
+        <path d="M15 29 Q20 33.5 25 29" stroke="#1C1F23" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+      </svg>
+      <h2>Sign in to FreshCatch</h2>
+      <p>Enter your access code to open the dashboard. It stays on this device until you log out.</p>
+      <p id="gateError" class="gate-error hidden"></p>
       <form id="gateForm">
         <input id="gateInput" type="password" placeholder="Access code" autocomplete="current-password">
-        <button type="submit">Unlock</button>
+        <button type="submit">Sign in</button>
       </form>
     </div>
   </div>
@@ -42,6 +49,12 @@
       <span id="newBannerText"></span>
       <button id="newBannerBtn" type="button" class="linklike">show them</button>
     </section>
+
+    <nav class="viewtabs" id="viewTabs" aria-label="Dashboard view">
+      <button class="viewtab active" data-view="radar" type="button">Latest radar</button>
+      <button class="viewtab" data-view="library" type="button">All keywords</button>
+      <span id="storedCount" class="stored-count"></span>
+    </nav>
 
     <nav class="chiprow" id="hubChips" aria-label="Niche hubs"></nav>
     <nav class="chiprow" id="tierChips" aria-label="Freshness tiers">
@@ -58,6 +71,7 @@
         <button id="starBtn" class="ghost" type="button" title="Show shortlist only">★ <span id="starCount">0</span></button>
         <button id="exportBtn" class="ghost" type="button" title="Export CSV">⬇ CSV</button>
         <button id="settingsBtn" class="ghost" type="button" title="Settings">⚙</button>
+        <button id="logoutBtn" class="ghost hidden" type="button" title="Log out" aria-label="Log out">⏻</button>
       </div>
     </div>
 
@@ -65,8 +79,8 @@
 
     <div id="empty" class="empty">
       <div class="empty-fish">🐟</div>
-      <h2>No catch yet</h2>
-      <p>Press <b>Scan Now</b> to dig this week's fresh micro keywords out of your niches —
+      <h2 id="emptyTitle">No catch yet</h2>
+      <p id="emptyText">Press <b>Scan Now</b> to dig this week's fresh micro keywords out of your niches —
          or wait for the daily automatic scan.</p>
     </div>
 
@@ -94,6 +108,11 @@
       <b>Settings</b>
       <button id="settingsClose" class="ghost" type="button" aria-label="Close">✕</button>
     </div>
+
+    <section class="drawer-section">
+      <h3>Account</h3>
+      <div id="accountBox" class="account-box"></div>
+    </section>
 
     <section class="drawer-section">
       <h3>Integrations</h3>

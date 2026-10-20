@@ -10,6 +10,9 @@ const state = {
   lastVisit: Number(localStorage.getItem('fc_last_visit') || 0),
   code: localStorage.getItem('fc_access_code') || '',
   scanning: false,
+  view: 'radar',
+  protected: false,
+  library: null,
 };
 
 /* ------------------------------ helpers ------------------------------ */
@@ -36,7 +39,7 @@ async function api(path, opts = {}) {
   if (state.code) headers['x-access-code'] = state.code;
   const res = await fetch(path, { ...opts, headers });
   if (res.status === 401) {
-    showGate();
+    handleUnauthorized();
     throw new Error('unauthorized');
   }
   if (!res.ok) {
@@ -143,14 +146,147 @@ function barHTML(label, value, invert) {
 
 function renderRows(rows) {
   const list = $('#list');
-  $('#empty').classList.toggle('hidden', rows.length > 0);
+  if (rows.length) {
+    $('#empty').classList.add('hidden');
+  } else {
+    emptyState(
+      'No catch yet',
+      "Press <b>Scan Now</b> to dig this week's fresh micro keywords out of your niches — or wait for the daily automatic scan."
+    );
+  }
   list.innerHTML = rows.map(cardHTML).join('');
 }
 
 async function loadKeywords(opts = {}) {
   const data = await api('/api/keywords?' + queryPath(opts));
+  $('#list').classList.remove('library-mode');
   renderRows(data.rows || []);
   return data.rows || [];
+}
+
+/* ------------------------------ keyword library ------------------------------ */
+
+function emptyState(title, text) {
+  $('#emptyTitle').textContent = title;
+  $('#emptyText').innerHTML = text;
+  $('#empty').classList.remove('hidden');
+}
+
+function hubLabelOf(hubId) {
+  return (state.hubs.find((h) => h.id === hubId) || {}).label || hubId;
+}
+
+function formatDate(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return new Date(n).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function earliestOf(items) {
+  return items.reduce((min, r) => {
+    const n = Number(r.first_seen_at) || Infinity;
+    return n < min ? n : min;
+  }, Infinity);
+}
+
+function renderLibrary() {
+  const list = $('#list');
+  list.classList.add('library-mode');
+  const all = state.library || [];
+  let rows = all;
+
+  const q = state.filter.q.toLowerCase();
+  if (q) rows = rows.filter((r) => String(r.keyword).toLowerCase().includes(q));
+  if (state.filter.starred) rows = rows.filter((r) => r.starred);
+
+  if (!rows.length) {
+    list.innerHTML = '';
+    if (all.length) {
+      emptyState(
+        'No match in the library',
+        'Nothing stored matches this filter — clear the search or shortlist filter to see everything again.'
+      );
+    } else {
+      emptyState(
+        'Library is empty',
+        'Every keyword a scan catches is stored here permanently. Run a scan to stock it up.'
+      );
+    }
+    return;
+  }
+
+  $('#empty').classList.add('hidden');
+
+  const groups = new Map();
+  for (const r of rows) {
+    if (!groups.has(r.hub)) groups.set(r.hub, []);
+    groups.get(r.hub).push(r);
+  }
+  const ordered = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+
+  const niches = new Set(all.map((r) => r.hub)).size;
+  const stars = all.filter((r) => r.starred).length;
+  const oldest = earliestOf(all);
+
+  list.innerHTML =
+    `<div class="lib-summary">
+       <b>${all.length}</b> keyword${all.length === 1 ? '' : 's'} stored across <b>${niches}</b> niche${niches === 1 ? '' : 's'}
+       ${stars ? ` · <b>${stars}</b> shortlisted` : ''}
+       ${Number.isFinite(oldest) ? ` · catching since ${esc(formatDate(oldest))}` : ''}
+       <div class="dim">Full archive — keywords are kept between scans and visits. Search filters it live; stars work here too.</div>
+     </div>` +
+    ordered
+      .map(([hub, items]) => {
+        const earliest = earliestOf(items);
+        return `<section class="lib-group">
+          <div class="lib-group-head">
+            <h2>${esc(hubLabelOf(hub))}</h2>
+            <span>${items.length} keyword${items.length === 1 ? '' : 's'}${Number.isFinite(earliest) ? ` · since ${esc(formatDate(earliest))}` : ''}</span>
+          </div>
+          <div class="cards">${items.map(cardHTML).join('')}</div>
+        </section>`;
+      })
+      .join('');
+}
+
+async function loadLibrary() {
+  if (!state.library) {
+    const data = await api('/api/keywords?limit=1000');
+    state.library = data.rows || [];
+  }
+  renderLibrary();
+}
+
+function switchViewUI(view) {
+  state.view = view;
+  [...$('#viewTabs').querySelectorAll('.viewtab')].forEach((b) =>
+    b.classList.toggle('active', b.dataset.view === view)
+  );
+  const library = view === 'library';
+  $('#hubChips').classList.toggle('hidden', library);
+  $('#tierChips').classList.toggle('hidden', library);
+  $('#search').value = '';
+  state.filter.q = '';
+  state.filter.starred = false;
+  $('#starBtn').classList.remove('active');
+}
+
+function setView(view) {
+  switchViewUI(view);
+  if (view === 'library') loadLibrary().catch((err) => toast(err.message));
+  else loadKeywords().catch((err) => toast(err.message));
+}
+
+async function refreshStoredCount() {
+  try {
+    const data = await api('/api/keywords?limit=1');
+    const n = Number(data.total) || 0;
+    $('#storedCount').textContent = n ? `${n} stored` : 'nothing stored yet';
+  } catch {}
+  try {
+    const starred = await api('/api/keywords?starred=1&limit=1');
+    $('#starCount').textContent = Number(starred.total) || 0;
+  } catch {}
 }
 
 function renderHubChips() {
@@ -201,13 +337,45 @@ function renderCustomHubs() {
     : '<p class="hint">No custom niches yet.</p>';
 }
 
+function renderAccount() {
+  const box = $('#accountBox');
+  if (state.protected) {
+    box.innerHTML = `
+      <div class="account-row"><span>Session</span><span class="pill on">signed in</span></div>
+      <div class="account-row"><span>Dashboard access</span><span class="pill on">access code</span></div>
+      <button class="logout-wide" type="button" data-logout>Log out of this device</button>`;
+  } else {
+    box.innerHTML = `
+      <div class="account-row"><span>Session</span><span class="pill off">open access</span></div>
+      <p class="hint">No <code>ACCESS_CODE</code> is set on the server, so sign-in is off. Set it in the host's environment variables to require the login screen.</p>`;
+  }
+}
+
+function logout() {
+  localStorage.removeItem('fc_access_code');
+  state.code = '';
+  state.library = null;
+  state.filter = { hub: 'all', tier: 'all', q: '', starred: false };
+  $('#search').value = '';
+  $('#settings').classList.add('hidden');
+  $('#scanPanel').classList.add('hidden');
+  showGate();
+  $('#gateInput').value = '';
+  $('#gateInput').focus();
+}
+
 async function boot() {
+  let s;
   try {
-    await loadState();
+    s = await loadState();
   } catch (e) {
     if (e.message !== 'unauthorized') toast('Could not load state: ' + e.message);
     return;
   }
+  state.protected = !!s.accessProtected;
+  $('#logoutBtn').classList.toggle('hidden', !state.protected);
+  renderAccount();
+  $('#accessGate').classList.add('hidden');
   $('#app').classList.remove('hidden');
 
   // "New since your last visit" banner
@@ -228,10 +396,16 @@ async function boot() {
     toast('Could not load keywords: ' + e.message);
   }
 
+  refreshStoredCount();
   localStorage.setItem('fc_last_visit', String(Date.now()));
 }
 
 /* ------------------------------ interactions ------------------------------ */
+
+$('#viewTabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.viewtab');
+  if (btn && btn.dataset.view !== state.view) setView(btn.dataset.view);
+});
 
 $('#hubChips').addEventListener('click', (e) => {
   const btn = e.target.closest('.chip');
@@ -254,11 +428,13 @@ $('#search').addEventListener('input', (e) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     state.filter.q = e.target.value.trim();
-    loadKeywords().catch(() => {});
+    if (state.view === 'library') renderLibrary();
+    else loadKeywords().catch(() => {});
   }, 250);
 });
 
 $('#newBannerBtn').addEventListener('click', () => {
+  if (state.view === 'library') switchViewUI('radar');
   loadKeywords({ since: state.lastVisit, hub: 'all', tier: 'all', starred: false })
     .then((rows) => {
       toast(`Showing ${rows.length} new keywords — clear filters to go back.`);
@@ -269,7 +445,8 @@ $('#newBannerBtn').addEventListener('click', () => {
 $('#starBtn').addEventListener('click', () => {
   state.filter.starred = !state.filter.starred;
   $('#starBtn').classList.toggle('active', state.filter.starred);
-  loadKeywords().catch((err) => toast(err.message));
+  if (state.view === 'library') renderLibrary();
+  else loadKeywords().catch((err) => toast(err.message));
 });
 
 $('#list').addEventListener('click', async (e) => {
@@ -300,6 +477,10 @@ $('#list').addEventListener('click', async (e) => {
       starBtn.classList.toggle('starred', starred);
       starBtn.textContent = starred ? '★ Shortlisted' : '☆ Shortlist';
       card.classList.toggle('is-starred', starred);
+      if (state.library) {
+        const row = state.library.find((r) => r.hub === hub && r.keyword === kw);
+        if (row) row.starred = starred ? 1 : 0;
+      }
       toast(starred ? `Shortlisted “${kw}”` : `Removed “${kw}” from shortlist`);
     } catch (err) {
       toast(err.message);
@@ -309,7 +490,8 @@ $('#list').addEventListener('click', async (e) => {
 
 $('#exportBtn').addEventListener('click', async () => {
   try {
-    const res = await fetch('/api/export.csv?' + queryPath(), {
+    const qp = state.view === 'library' ? '' : queryPath();
+    const res = await fetch('/api/export.csv?' + qp, {
       headers: state.code ? { 'x-access-code': state.code } : {},
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -458,15 +640,36 @@ function finishScan(isError) {
   if (!state.scanning) return;
   state.scanning = false;
   $('#scanBtn').disabled = false;
-  loadKeywords().catch(() => {});
+  state.library = null;
+  refreshStoredCount();
+  if (state.view === 'library') loadLibrary().catch(() => {});
+  else loadKeywords().catch(() => {});
   if (!isError) toast('Scan complete — fresh keywords loaded');
 }
 
-/* ------------------------------ access gate ------------------------------ */
+/* ------------------------------ login / logout ------------------------------ */
 
-function showGate() {
+function showGate(errorMsg) {
   $('#app').classList.add('hidden');
+  $('#settings').classList.add('hidden');
+  $('#scanPanel').classList.add('hidden');
+  const err = $('#gateError');
+  if (errorMsg) {
+    err.textContent = errorMsg;
+    err.classList.remove('hidden');
+  } else {
+    err.textContent = '';
+    err.classList.add('hidden');
+  }
   $('#accessGate').classList.remove('hidden');
+}
+
+function handleUnauthorized() {
+  const hadCode = !!state.code;
+  state.code = '';
+  state.library = null;
+  localStorage.removeItem('fc_access_code');
+  showGate(hadCode ? 'That access code was not accepted — try again.' : '');
 }
 
 $('#gateForm').addEventListener('submit', (e) => {
@@ -477,6 +680,11 @@ $('#gateForm').addEventListener('submit', (e) => {
   state.code = code;
   $('#accessGate').classList.add('hidden');
   boot();
+});
+
+$('#logoutBtn').addEventListener('click', logout);
+$('#accountBox').addEventListener('click', (e) => {
+  if (e.target.closest('[data-logout]')) logout();
 });
 
 /* ------------------------------ PWA ------------------------------ */
