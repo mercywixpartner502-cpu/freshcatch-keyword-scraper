@@ -11,6 +11,7 @@ const state = {
   authMode: 'open',
   user: null,
   authed: false,
+  serverless: false,
   scanning: false,
   view: 'radar',
   protected: false,
@@ -313,11 +314,11 @@ async function loadState() {
 
 function renderIntegrations(s) {
   const items = [
-    ['Database', s.dbMode === 'turso' ? 'Turso (cloud)' : 'Local SQLite', true],
+    ['Database', s.dbMode === 'turso' ? 'Turso (cloud)' : s.dbEphemeral ? 'Local SQLite (ephemeral)' : 'Local SQLite', true],
     ['Telegram alerts', s.telegram ? 'connected' : 'not set', s.telegram],
     ['AI layer', s.ai ? 'active' : 'not set', s.ai],
     ['Daily auto-scan', `hour ${s.scanHour}`, true],
-    ['Scan scheduler', 'running', true],
+    ['Scan scheduler', s.serverless ? 'Vercel cron' : 'running', true],
   ];
   $('#integrationList').innerHTML = items
     .map(
@@ -325,6 +326,8 @@ function renderIntegrations(s) {
         `<li><span>${esc(label)}</span><span class="pill ${on ? 'on' : 'off'}">${esc(value)}</span></li>`
     )
     .join('');
+  const hint = $('#storageHint');
+  if (hint) hint.classList.toggle('hidden', !s.dbEphemeral);
   renderCustomHubs();
 }
 
@@ -381,6 +384,7 @@ async function boot() {
   state.protected = !!s.accessProtected;
   state.authMode = s.authMode || (s.accessProtected ? 'code' : 'open');
   state.user = s.user || null;
+  state.serverless = !!s.serverless;
   state.authed = true;
   $('#logoutBtn').classList.toggle('hidden', !state.protected);
   renderAccount();
@@ -588,58 +592,116 @@ function startScan() {
   $('#scanProgress').textContent = 'warming up';
   $('#scanPanel').classList.remove('hidden');
 
-  const params = new URLSearchParams();
-  if (state.filter.hub && state.filter.hub !== 'all') params.set('hubs', state.filter.hub);
+  const single = state.filter.hub && state.filter.hub !== 'all' ? state.filter.hub : '';
 
-  const es = new EventSource('/api/scan?' + params.toString());
+  // Serverless functions get killed at a hard time limit, so there we scan one
+  // hub per request (each fits comfortably) and chain them from the browser.
+  if (state.serverless) {
+    const queue = single
+      ? [{ id: single, label: hubLabelOf(single) }]
+      : state.hubs.map((h) => ({ id: h.id, label: h.label }));
+    scanQueue(queue).catch((err) => {
+      scanLogLine(`✖ ${err.message}`, 'err');
+      finishScan(true);
+    });
+    return;
+  }
 
-  es.onmessage = (ev) => {
-    let data;
-    try {
-      data = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    switch (data.type) {
-      case 'start':
-        scanLogLine(`scan #${data.scanId} started · ${data.hubs.length} niche hub(s)`);
-        $('#scanProgress').textContent = `${data.hubs.length} hubs queued`;
-        break;
-      case 'hub-start':
-        scanLogLine(`▸ ${data.label}: digging…`);
-        $('#scanProgress').textContent = `scanning ${data.label}`;
-        break;
-      case 'log':
-        scanLogLine(`  ${data.msg}`);
-        break;
-      case 'hub-done':
-        scanLogLine(`✔ ${data.label}: ${data.names} names · ${data.keywords} keywords · ${data.new} new`, 'ok');
-        $('#scanProgress').textContent = `${data.label} done — ${data.new} new`;
-        break;
-      case 'done': {
-        const s = data.summary;
-        scanLogLine(
-          `✔ scan finished in ${Math.round(s.ms / 1000)}s — ${s.totalKeywords} keywords, ${s.newKeywords} new`,
-          'ok'
-        );
-        $('#scanTitle').textContent = 'Catch of the day is in';
-        $('#scanProgress').textContent = `${s.newKeywords} new · ${s.totalKeywords} total`;
-        es.close();
-        finishScan();
-        break;
+  scanStream(single, true)
+    .then((res) => finishScan(!res.ok))
+    .catch((err) => {
+      scanLogLine(`✖ ${err.message}`, 'err');
+      finishScan(true);
+    });
+}
+
+// One SSE scan request. Resolves with { ok, summary } when the stream ends.
+function scanStream(hubParam, isFinal) {
+  return new Promise((resolve) => {
+    const params = new URLSearchParams();
+    if (hubParam) params.set('hubs', hubParam);
+
+    const es = new EventSource('/api/scan?' + params.toString());
+    let settled = false;
+    const settle = (ok, summary) => {
+      if (settled) return;
+      settled = true;
+      es.close();
+      resolve({ ok, summary });
+    };
+
+    es.onmessage = (ev) => {
+      let data;
+      try {
+        data = JSON.parse(ev.data);
+      } catch {
+        return;
       }
-      case 'error':
-        scanLogLine(`✖ ${data.message}`, 'err');
-        es.close();
-        finishScan(true);
-        break;
-    }
-  };
+      switch (data.type) {
+        case 'start':
+          scanLogLine(`scan #${data.scanId} started · ${data.hubs.length} niche hub(s)`);
+          $('#scanProgress').textContent = `${data.hubs.length} hubs queued`;
+          break;
+        case 'hub-start':
+          scanLogLine(`▸ ${data.label}: digging…`);
+          $('#scanProgress').textContent = `scanning ${data.label}`;
+          break;
+        case 'log':
+          scanLogLine(`  ${data.msg}`);
+          break;
+        case 'hub-done':
+          scanLogLine(`✔ ${data.label}: ${data.names} names · ${data.keywords} keywords · ${data.new} new`, 'ok');
+          $('#scanProgress').textContent = `${data.label} done — ${data.new} new`;
+          break;
+        case 'done': {
+          const s = data.summary;
+          if (isFinal) {
+            scanLogLine(
+              `✔ scan finished in ${Math.round(s.ms / 1000)}s — ${s.totalKeywords} keywords, ${s.newKeywords} new`,
+              'ok'
+            );
+            $('#scanTitle').textContent = 'Catch of the day is in';
+            $('#scanProgress').textContent = `${s.newKeywords} new · ${s.totalKeywords} total`;
+          }
+          settle(true, s);
+          break;
+        }
+        case 'error':
+          scanLogLine(`✖ ${data.message}`, 'err');
+          settle(false, null);
+          break;
+      }
+    };
 
-  es.onerror = () => {
-    // Stream ended or dropped; if the server is still scanning that's fine.
-    if (es.readyState === EventSource.CLOSED) finishScan();
-  };
+    es.onerror = () => {
+      // Stream ended or dropped; if the server is still scanning that's fine.
+      if (es.readyState === EventSource.CLOSED) settle(false, null);
+    };
+  });
+}
+
+async function scanQueue(queue) {
+  const startedAt = Date.now();
+  let newTotal = 0;
+  let grandTotal = 0;
+
+  for (let i = 0; i < queue.length; i += 1) {
+    const hub = queue[i];
+    $('#scanProgress').textContent = `hub ${i + 1}/${queue.length} — ${hub.label}`;
+    const res = await scanStream(hub.id, false);
+    if (!res.ok) return finishScan(true);
+    newTotal += res.summary.newKeywords || 0;
+    grandTotal = res.summary.totalKeywords || grandTotal;
+  }
+
+  const ms = Date.now() - startedAt;
+  scanLogLine(
+    `✔ scan finished in ${Math.round(ms / 1000)}s — ${grandTotal} keywords, ${newTotal} new`,
+    'ok'
+  );
+  $('#scanTitle').textContent = 'Catch of the day is in';
+  $('#scanProgress').textContent = `${newTotal} new · ${grandTotal} total`;
+  finishScan(false);
 }
 
 function finishScan(isError) {

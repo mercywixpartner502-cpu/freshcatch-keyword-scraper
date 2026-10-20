@@ -286,6 +286,8 @@ async function handleState(req, res) {
     accessProtected: AUTH_REQUIRED,
     authMode: LOGIN_ENABLED ? 'password' : ACCESS_CODE ? 'code' : 'open',
     user: (readSession(req) || {}).user || null,
+    serverless: !!process.env.VERCEL,
+    dbEphemeral: !!process.env.VERCEL && db.mode === 'file',
     scanHour: SCAN_HOUR,
     publicUrl: process.env.PUBLIC_URL || null,
     hubs: hubs.map((h) => ({ id: h.id, label: h.label, custom: !h.builtin })),
@@ -486,9 +488,37 @@ function handleScanSSE(req, res, url) {
     });
 }
 
-/* ------------------------------ main server ------------------------------ */
+/* ------------------------------ request handler ------------------------------ */
 
-const server = http.createServer(async (req, res) => {
+let dbInitPromise = null;
+function ensureDb() {
+  if (!dbInitPromise) dbInitPromise = db.init();
+  return dbInitPromise;
+}
+
+async function handleCron(req, res) {
+  const secret = process.env.CRON_SECRET || '';
+  if (secret) {
+    if ((req.headers.authorization || '') !== `Bearer ${secret}`) {
+      return sendJSON(res, 401, { error: 'unauthorized' });
+    }
+  } else if (!process.env.VERCEL) {
+    return sendJSON(res, 404, { error: 'unknown api route' });
+  }
+  if (scanning) return sendJSON(res, 200, { ok: true, skipped: 'a scan is already running' });
+  scanning = true;
+  try {
+    const hubs = await activeHubs();
+    const hub = hubs[Math.floor(Date.now() / 86400000) % hubs.length];
+    const summary = await runScan({ trigger: 'scheduled', hubIds: [hub.id] });
+    sendJSON(res, 200, { ok: true, hub: hub.id, summary });
+  } finally {
+    scanning = false;
+  }
+}
+
+async function handleRequest(req, res) {
+  await ensureDb();
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -502,6 +532,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/auth') return handleAuthInfo(req, res);
     if (p === '/api/login' && req.method === 'POST') return await handleLogin(req, res);
     if (p === '/api/logout' && req.method === 'POST') return handleLogout(req, res);
+    if (p === '/api/cron') return await handleCron(req, res);
 
     if (p.startsWith('/api/')) {
       if (!authorized(req, url)) return sendJSON(res, 401, { error: 'unauthorized' });
@@ -521,38 +552,42 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     sendJSON(res, 500, { error: String((err && err.message) || err) });
   }
-});
+}
+
+const server = http.createServer(handleRequest);
 
 /* ------------------------------ background ------------------------------ */
 
-// Daily scheduler — fires at SCAN_HOUR even if the dashboard is never opened.
-let lastScheduledDay = null;
-setInterval(
-  () => {
-    const now = new Date();
-    const day = now.toISOString().slice(0, 10);
-    if (now.getHours() === SCAN_HOUR && lastScheduledDay !== day && !scanning) {
-      lastScheduledDay = day;
-      runScan({ trigger: 'scheduled' }).catch((e) =>
-        console.error('scheduled scan failed:', e && e.message)
-      );
-    }
-  },
-  5 * 60 * 1000
-);
-
-// Keep-alive self-ping — stops the free host from sleeping between scans.
-if (process.env.PUBLIC_URL) {
+if (!process.env.VERCEL) {
+  // Daily scheduler — fires at SCAN_HOUR even if the dashboard is never opened.
+  let lastScheduledDay = null;
   setInterval(
-    () => fetch(`${process.env.PUBLIC_URL}/api/ping`).catch(() => {}),
-    10 * 60 * 1000
+    () => {
+      const now = new Date();
+      const day = now.toISOString().slice(0, 10);
+      if (now.getHours() === SCAN_HOUR && lastScheduledDay !== day && !scanning) {
+        lastScheduledDay = day;
+        runScan({ trigger: 'scheduled' }).catch((e) =>
+          console.error('scheduled scan failed:', e && e.message)
+        );
+      }
+    },
+    5 * 60 * 1000
   );
+
+  // Keep-alive self-ping — stops the free host from sleeping between scans.
+  if (process.env.PUBLIC_URL) {
+    setInterval(
+      () => fetch(`${process.env.PUBLIC_URL}/api/ping`).catch(() => {}),
+      10 * 60 * 1000
+    );
+  }
 }
 
 /* ------------------------------ boot ------------------------------ */
 
 async function boot() {
-  const info = await db.init();
+  const info = await ensureDb();
   console.log(`FreshCatch · database: ${info.mode}`);
   server.listen(PORT, HOST, () => {
     console.log(`FreshCatch running →  http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
@@ -572,7 +607,11 @@ async function boot() {
   }
 }
 
-boot().catch((e) => {
-  console.error('boot failed:', e);
-  process.exit(1);
-});
+if (require.main === module) {
+  boot().catch((e) => {
+    console.error('boot failed:', e);
+    process.exit(1);
+  });
+}
+
+module.exports = { handleRequest };

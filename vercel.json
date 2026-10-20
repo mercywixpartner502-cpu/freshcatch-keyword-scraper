@@ -1,0 +1,26 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/api/ping", "destination": "/api/index?__fcpath=ping" },
+    { "source": "/api/auth", "destination": "/api/index?__fcpath=auth" },
+    { "source": "/api/login", "destination": "/api/index?__fcpath=login" },
+    { "source": "/api/logout", "destination": "/api/index?__fcpath=logout" },
+    { "source": "/api/state", "destination": "/api/index?__fcpath=state" },
+    { "source": "/api/keywords", "destination": "/api/index?__fcpath=keywords" },
+    { "source": "/api/keywords/star", "destination": "/api/index?__fcpath=keywords%2Fstar" },
+    { "source": "/api/hubs", "destination": "/api/index?__fcpath=hubs" },
+    { "source": "/api/sources/health", "destination": "/api/index?__fcpath=sources%2Fhealth" },
+    { "source": "/api/export.csv", "destination": "/api/index?__fcpath=export.csv" },
+    { "source": "/api/scan", "destination": "/api/index?__fcpath=scan" },
+    { "source": "/api/cron", "destination": "/api/index?__fcpath=cron" }
+  ],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 300,
+      "memory": 1024
+    }
+  },
+  "crons": [
+    { "path": "/api/cron", "schedule": "15 8 * * *" }
+  ]
+}
