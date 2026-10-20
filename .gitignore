@@ -2,5 +2,7 @@ node_modules/
 .env
 data/
 *.log
+.vercel/
+.vercel-tmp/
 .DS_Store
 Thumbs.db
